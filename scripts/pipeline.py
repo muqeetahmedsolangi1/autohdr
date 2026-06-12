@@ -57,7 +57,7 @@ def align_ecc(images, work_width=1000):
 
 # -------------------------------------------------------------- window pull
 
-def build_window_mask(images, seg_mask=None):
+def build_window_mask(mid, seg_mask=None):
     """Soft mask of blown window glass.
 
     Gated by actual clipping in the mid exposure (>= 235) so a wall or
@@ -66,8 +66,7 @@ def build_window_mask(images, seg_mask=None):
     pixels still get a gentle pull. A wrong segmentation label cannot
     create an artifact because non-clipped pixels stay at zero.
     """
-    mid_gray = cv2.cvtColor(images[len(images) // 2],
-                            cv2.COLOR_BGR2GRAY).astype(np.float32)
+    mid_gray = cv2.cvtColor(mid, cv2.COLOR_BGR2GRAY).astype(np.float32)
     ramp = np.clip((mid_gray - 235.0) / 20.0, 0, 1)
     if seg_mask is not None:
         ramp = ramp * (0.35 + 0.65 * seg_mask)
@@ -75,7 +74,7 @@ def build_window_mask(images, seg_mask=None):
     return cv2.GaussianBlur(ramp, (k, k), 0)
 
 
-def window_content(images, wmask, target=0.72):
+def window_content(dark_bracket, wmask, target=0.72):
     """Prepare the view-through-the-glass layer from the darkest bracket.
 
     This is the Autoenhance recipe: take the bracket with the most
@@ -87,7 +86,7 @@ def window_content(images, wmask, target=0.72):
     sel = wmask > 0.5
     if not sel.any():
         return None
-    dark = images[0].astype(np.float32) / 255.0
+    dark = dark_bracket.astype(np.float32) / 255.0
     med = float(np.median(dark.mean(axis=2)[sel]))
     gain = np.clip(target / max(med, 1e-3), 1.0, 2.4)
     content = np.clip(dark * gain, 0, 1)
@@ -209,9 +208,10 @@ def auto_levels(img, black_pct=0.4, white_pct=99.7, max_black=0.25,
     if hi - lo < 0.1:
         return img
     # measured from AutoHDR outputs: blacks sit at ~17/255 (soft, not
-    # crushed) and whites at ~235/255 (bright but never blasted)
+    # crushed) and whites at ~235/255 (bright but never blasted); the
+    # later gamma brighten lifts the floor further, hence 0.02 here
     out = np.clip((img - lo) / (hi - lo), 0, 1)
-    return out * (0.93 - 0.05) + 0.05
+    return out * (0.91 - 0.02) + 0.02
 
 
 def auto_exposure(img, target=0.60):
@@ -269,7 +269,7 @@ def vibrance(img, factor=1.25):
     return out.astype(np.float32) / 255.0
 
 
-def sharpen_two_stage(img, fine_amount=0.4, clarity_amount=0.15):
+def sharpen_two_stage(img, fine_amount=0.9, clarity_amount=0.2):
     """Fine unsharp mask for edge crispness + wide-radius local contrast
     (the Lightroom 'Clarity' effect). Runs last in the pipeline."""
     fine = cv2.GaussianBlur(img, (0, 0), 1.0)
@@ -280,6 +280,9 @@ def sharpen_two_stage(img, fine_amount=0.4, clarity_amount=0.15):
 
 # ------------------------------------------------------------------ pipeline
 
+MAX_WIDTH = int(__import__("os").environ.get("AUTOHDR_MAX_WIDTH", 4000))
+
+
 def process_brackets(images):
     if len(images) < 2:
         raise ValueError("need at least 2 bracketed exposures")
@@ -287,9 +290,15 @@ def process_brackets(images):
     # darkest first — upload order is unknown
     images = sorted(images, key=lambda im: im.mean())
 
-    # alignment needs equal sizes; resize to the smallest frame
+    # alignment needs equal sizes; resize to the smallest frame, capped at
+    # MAX_WIDTH — 45MP x 7 brackets needs more RAM than a laptop has, and
+    # 4000px output is plenty for listings (raise AUTOHDR_MAX_WIDTH on a
+    # bigger machine)
     h = min(im.shape[0] for im in images)
     w = min(im.shape[1] for im in images)
+    if w > MAX_WIDTH:
+        h = int(h * MAX_WIDTH / w)
+        w = MAX_WIDTH
     images = [
         im if im.shape[:2] == (h, w)
         else cv2.resize(im, (w, h), interpolation=cv2.INTER_AREA)
@@ -299,9 +308,13 @@ def process_brackets(images):
     images = align_ecc(images)
     fused = cv2.createMergeMertens().process(images)
 
-    masks = window_mask.get_label_masks(images[len(images) // 2])
+    dark = images[0]
+    mid = images[len(images) // 2]
+    del images  # free the other brackets — only dark + mid are needed now
+
+    masks = window_mask.get_label_masks(mid)
     seg_win = masks["window"] if masks else None
-    wmask = build_window_mask(images, seg_win)
+    wmask = build_window_mask(mid, seg_win)
 
     # interior finishing — windows excluded from WB and levels measurement.
     # Brightness FIRST, color cleanup AFTER: the lamp/wall neutralizers
@@ -309,7 +322,9 @@ def process_brackets(images):
     # at its final brightness.
     img = white_patch_wb(fused.astype(np.float32), exclude=wmask)
     img = auto_levels(img, exclude=wmask)
-    img = auto_exposure(img, target=0.74)  # measured: AutoHDR median ~189/255
+    img = auto_exposure(img, target=0.70)  # measured: AutoHDR median ~189/255
+    #     (target sits below 189/255=0.74 because the S-curve and window
+    #      blend later push the median up — 0.70 lands measured ~189)
     img = whiten_lamps(img)
     img = neutralize_whites(
         img,
@@ -319,11 +334,9 @@ def process_brackets(images):
     img = match_neutral_whites(img)
     img = s_curve(img, strength=0.05)  # measured: their contrast is gentle
 
-    # window pull LAST, so interior brightening can't wash the glass out
-    content = window_content(images, wmask)
-    if content is not None:
-        m = wmask[..., None]
-        img = img * (1 - m) + content * m
+    # window pull disabled for now (color-tuning phase) — wmask is still
+    # computed above because WB/levels must exclude window pixels.
+    # To re-enable, blend window_content(dark, wmask) back in here.
 
     img = sharpen_two_stage(img)
     return (img * 255).clip(0, 255).astype("uint8")
