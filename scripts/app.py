@@ -59,10 +59,18 @@ PAGE = """
 </style>
 <h1>AutoHDR</h1>
 <div class="card">
-  <p>Same scene 2–5 different exposure photos select:</p>
+  <p>Same scene 2–7 different exposure photos select:</p>
   <form method="post" action="/process" enctype="multipart/form-data">
     <input type="file" name="brackets" accept="image/*" multiple required>
-    <p><button>Merge & Enhance</button></p>
+    <p>
+      <label><input type="checkbox" name="enhance" checked>
+        <b>HDR enhance</b> — calibrated color/tone finishing</label><br>
+      <label><input type="checkbox" name="windowpull">
+        <b>Window pull</b> — recover the view through windows</label>
+    </p>
+    <p style="color:#666;font-size:13px">Brackets are always merged; tick
+      one or both. Nothing ticked = plain merge.</p>
+    <p><button>Process</button></p>
   </form>
   {% if error %}<p class="err">{{ error }}</p>{% endif %}
   {% if result %}
@@ -94,7 +102,11 @@ def process():
         )
 
     start = time.time()
-    result = pipeline.process_brackets(images)
+    result = pipeline.process_brackets(
+        images,
+        enhance=("enhance" in request.form),
+        pull_windows=("windowpull" in request.form),
+    )
     took = round(time.time() - start, 1)
 
     name = f"hdr_{int(time.time() * 1000)}.jpg"

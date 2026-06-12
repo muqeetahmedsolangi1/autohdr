@@ -283,7 +283,7 @@ def sharpen_two_stage(img, fine_amount=0.9, clarity_amount=0.2):
 MAX_WIDTH = int(__import__("os").environ.get("AUTOHDR_MAX_WIDTH", 4000))
 
 
-def process_brackets(images):
+def process_brackets(images, enhance=True, pull_windows=False):
     if len(images) < 2:
         raise ValueError("need at least 2 bracketed exposures")
 
@@ -316,27 +316,34 @@ def process_brackets(images):
     seg_win = masks["window"] if masks else None
     wmask = build_window_mask(mid, seg_win)
 
-    # interior finishing — windows excluded from WB and levels measurement.
-    # Brightness FIRST, color cleanup AFTER: the lamp/wall neutralizers
-    # key on bright pixels, so they only see the casts once the image is
-    # at its final brightness.
-    img = white_patch_wb(fused.astype(np.float32), exclude=wmask)
-    img = auto_levels(img, exclude=wmask)
-    img = auto_exposure(img, target=0.70)  # measured: AutoHDR median ~189/255
-    #     (target sits below 189/255=0.74 because the S-curve and window
-    #      blend later push the median up — 0.70 lands measured ~189)
-    img = whiten_lamps(img)
-    img = neutralize_whites(
-        img,
-        boost=masks["wallceil"] if masks else None,
-        protect=masks["floor"] if masks else None,
-    )
-    img = match_neutral_whites(img)
-    img = s_curve(img, strength=0.05)  # measured: their contrast is gentle
+    img = fused.astype(np.float32)
+    if enhance:
+        # interior finishing — windows excluded from WB and levels
+        # measurement. Brightness FIRST, color cleanup AFTER: the
+        # lamp/wall neutralizers key on bright pixels, so they only see
+        # the casts once the image is at its final brightness.
+        img = white_patch_wb(img, exclude=wmask)
+        img = auto_levels(img, exclude=wmask)
+        img = auto_exposure(img, target=0.70)  # AutoHDR median ~189/255
+        #     (target sits below 189/255=0.74 because the S-curve and
+        #      window blend later push the median up)
+        img = whiten_lamps(img)
+        img = neutralize_whites(
+            img,
+            boost=masks["wallceil"] if masks else None,
+            protect=masks["floor"] if masks else None,
+        )
+        img = match_neutral_whites(img)
+        img = s_curve(img, strength=0.05)  # measured: gentle contrast
 
-    # window pull disabled for now (color-tuning phase) — wmask is still
-    # computed above because WB/levels must exclude window pixels.
-    # To re-enable, blend window_content(dark, wmask) back in here.
+    # window pull (optional) runs LAST, so interior brightening can't
+    # wash the glass back out. wmask is computed unconditionally above
+    # because WB/levels must exclude window pixels either way.
+    if pull_windows:
+        content = window_content(dark, wmask)
+        if content is not None:
+            m = wmask[..., None]
+            img = img * (1 - m) + content * m
 
     img = sharpen_two_stage(img)
     return (img * 255).clip(0, 255).astype("uint8")
