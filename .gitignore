@@ -1,0 +1,13 @@
+# runtime results from the web app
+web_output/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+
+# macOS
+.DS_Store
+
+# SAFNet eval outputs
+SAFNet/img_hdr_pred*/

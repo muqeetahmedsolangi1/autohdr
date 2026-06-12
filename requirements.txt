@@ -1,0 +1,9 @@
+# core pipeline + web app (Levels 1, 2, web)
+opencv-python>=4.8
+numpy>=1.24
+flask>=3.0
+
+# window segmentation (SegFormer) + Level 3 (SAFNet deep merge)
+torch>=2.2
+torchvision
+transformers
