@@ -12,9 +12,11 @@ import cv2
 import numpy as np
 
 # ADE20K class ids
-WINDOW_CLASSES = (8, 14)    # windowpane, door (glass doors)
-WALLCEIL_CLASSES = (0, 5)   # wall, ceiling
-FLOOR_CLASSES = (3, 28)     # floor, rug
+WINDOW_CLASSES = (8, 14)        # windowpane, door (glass doors)
+WALLCEIL_CLASSES = (0, 5)       # wall, ceiling
+FLOOR_CLASSES = (3, 28)         # floor, rug
+LAMP_CLASSES = (36, 82, 85)     # lamp, light/sconce, chandelier
+CABINET_CLASSES = (10, 15, 24)  # cabinet, table, shelf (warm wood surfaces)
 
 MODEL_ID = "nvidia/segformer-b0-finetuned-ade-512-512"
 
@@ -36,9 +38,9 @@ def _load():
 
 
 def get_label_masks(bgr):
-    """Dict of soft float32 masks {'window','wallceil','floor'} at full
-    resolution, or None if segmentation is unavailable. 'window' is None
-    when no windows are found."""
+    """Dict of soft float32 masks {'window','wallceil','floor','lamp',
+    'cabinet'} at full resolution, or None if segmentation is
+    unavailable. Individual entries are None when that class is absent."""
     try:
         import torch
         model, processor = _load()
@@ -64,6 +66,8 @@ def get_label_masks(bgr):
         "window": soft(WINDOW_CLASSES),
         "wallceil": soft(WALLCEIL_CLASSES),
         "floor": soft(FLOOR_CLASSES),
+        "lamp": soft(LAMP_CLASSES),
+        "cabinet": soft(CABINET_CLASSES),
     }
 
 

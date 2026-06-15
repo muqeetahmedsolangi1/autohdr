@@ -74,33 +74,47 @@ def build_window_mask(mid, seg_mask=None):
     return cv2.GaussianBlur(ramp, (k, k), 0)
 
 
-def window_content(dark_bracket, wmask, target=0.72):
+def window_content(dark_bracket, wmask, target=0.55):
     """Prepare the view-through-the-glass layer from the darkest bracket.
 
-    This is the Autoenhance recipe: take the bracket with the most
-    window information, enhance it separately (gain to a bright-but-
-    detailed level, neutral WB, gentle vibrance), and blend it back as
-    the LAST tonal step — so the interior brightening can never wash
-    the windows back out.
+    The darkest bracket already holds a correctly exposed outdoor view
+    (deep sky, sparkling water). The job here is to PRESERVE that and
+    make it pop — not bleach it. Two rules learned by measuring against
+    AutoHDR (which keeps windows vivid):
+
+      * NO white balance. The brightest window pixels are sky, not a
+        neutral reference; neutralizing them strips the blue and halves
+        saturation (measured 24 -> 12). Outdoor daylight is already
+        correctly balanced.
+      * Only lift exposure if the view is genuinely dark; never push it
+        toward white. Then add vibrance + a little contrast for punch.
     """
     sel = wmask > 0.5
     if not sel.any():
         return None
-    dark = dark_bracket.astype(np.float32) / 255.0
-    med = float(np.median(dark.mean(axis=2)[sel]))
-    gain = np.clip(target / max(med, 1e-3), 1.0, 2.4)
-    content = np.clip(dark * gain, 0, 1)
-    content = white_patch_wb(content, percentile=85.0, strength=1.0)
-    return vibrance(content, factor=1.15)
+    content = dark_bracket.astype(np.float32) / 255.0
+    med = float(np.median(content.mean(axis=2)[sel]))
+    if med < target:  # view is underexposed — gentle lift, never bleach
+        content = np.clip(content * np.clip(target / med, 1.0, 1.6), 0, 1)
+    content = vibrance(content, factor=1.7)      # deep sky, green foliage
+    content = s_curve(content, strength=0.12)     # sparkle / contrast
+    return np.clip(content, 0, 1)
 
 
-def whiten_lamps(img, strength=1.0, max_area_frac=0.015):
+def whiten_lamps(img, strength=1.0, max_area_frac=0.015, allow=None):
     """Turn warm light sources white (the AutoHDR rendering).
 
     Finds small, bright, warm blobs — bulbs, lamp shades, recessed-can
     glow pools — and pulls their color to neutral in LAB. Large warm
     areas (wood floors, furniture) are excluded by the component-size
-    filter, so only light sources are affected.
+    filter.
+
+    `allow` (segmented ceiling/wall/lamp region, cabinets removed) gates
+    WHERE whitening may happen. This is the fix for sunlit wood glints:
+    a specular highlight on a glossy cabinet is also "small + bright +
+    warm", indistinguishable from a bulb by pixels alone — but it does
+    not sit on a ceiling/wall/lamp, so `allow` excludes it and the wood
+    keeps its color. Without segmentation `allow` is None (old behavior).
     """
     lab = cv2.cvtColor((img * 255).astype(np.uint8),
                        cv2.COLOR_BGR2LAB).astype(np.float32)
@@ -114,6 +128,8 @@ def whiten_lamps(img, strength=1.0, max_area_frac=0.015):
     small = np.zeros(n, bool)
     small[1:] = stats[1:, cv2.CC_STAT_AREA] < h * w * max_area_frac
     keep = small[labels].astype(np.float32)
+    if allow is not None:
+        keep *= allow
     keep = cv2.GaussianBlur(keep, (0, 0), max(4.0, w * 0.002)) * strength
     lab[..., 1] = (lab[..., 1] - 128.0) * (1 - keep) + 128.0
     lab[..., 2] = (lab[..., 2] - 128.0) * (1 - keep) + 128.0
@@ -150,7 +166,8 @@ def white_patch_wb(img, percentile=92.0, strength=1.0, exclude=None):
     return np.clip(img * gains, 0, 1)
 
 
-def neutralize_whites(img, strength=1.0, boost=None, protect=None):
+def neutralize_whites(img, strength=1.0, boost=None, protect=None,
+                      lamp_allow=None):
     """Remove local warm/cool casts from surfaces that should be white.
 
     Mixed lighting (tungsten bulbs + daylight) tints walls and ceilings
@@ -160,9 +177,10 @@ def neutralize_whites(img, strength=1.0, boost=None, protect=None):
       * `boost` mask (segmented walls+ceiling): forced neutral even when
         warm light tinted them heavily — color alone can't separate a
         warm-lit white wall from a wood floor, semantics can;
-      * very bright pixels regardless of chroma — lamps and bulbs, which
-        the AutoHDR look renders white rather than orange.
-    `protect` (segmented floor/rug) is exempted so floors keep their color.
+      * very bright pixels — lamps/bulbs rendered white not orange; this
+        term is gated by `lamp_allow` (ceiling/wall/lamp region) so a
+        bright SATURATED highlight on wood is not stripped to gray.
+    `protect` (segmented floor/rug) is exempted so floors keep color.
     """
     lab = cv2.cvtColor((img * 255).astype(np.uint8),
                        cv2.COLOR_BGR2LAB).astype(np.float32)
@@ -179,6 +197,10 @@ def neutralize_whites(img, strength=1.0, boost=None, protect=None):
     if protect is not None:
         w_walls = w_walls * (1 - protect)
     w_lamps = np.clip((L - 0.85) / 0.10, 0, 1)
+    if lamp_allow is not None:
+        # off the ceiling/wall/lamp, only near-white (L>0.95) pixels are
+        # neutralized; saturated bright wood/metal keeps its color
+        w_lamps *= np.maximum(lamp_allow, np.clip((L - 0.95) / 0.05, 0, 1))
     w = cv2.GaussianBlur(np.maximum(w_walls, w_lamps), (0, 0), 8) * strength
     lab[..., 1] = a * (1 - w) + 128.0
     lab[..., 2] = b * (1 - w) + 128.0
@@ -316,6 +338,18 @@ def process_brackets(images, enhance=True, pull_windows=False):
     seg_win = masks["window"] if masks else None
     wmask = build_window_mask(mid, seg_win)
 
+    # where lamp-whitening is permitted: ceiling/wall/lamp, minus cabinets
+    # and other warm wood surfaces (so sunlit glints on wood keep color)
+    lamp_allow = None
+    if masks:
+        def _m(name):
+            return masks[name] if masks.get(name) is not None \
+                else np.zeros(mid.shape[:2], np.float32)
+        allow = np.clip(_m("wallceil") + _m("lamp") - _m("cabinet"), 0, 1)
+        kk = max(3, int(mid.shape[1] * 0.01) | 1)
+        lamp_allow = cv2.GaussianBlur(
+            cv2.dilate(allow, np.ones((kk, kk), np.uint8)), (kk, kk), 0)
+
     img = fused.astype(np.float32)
     if enhance:
         # interior finishing — windows excluded from WB and levels
@@ -327,11 +361,12 @@ def process_brackets(images, enhance=True, pull_windows=False):
         img = auto_exposure(img, target=0.70)  # AutoHDR median ~189/255
         #     (target sits below 189/255=0.74 because the S-curve and
         #      window blend later push the median up)
-        img = whiten_lamps(img)
+        img = whiten_lamps(img, allow=lamp_allow)
         img = neutralize_whites(
             img,
             boost=masks["wallceil"] if masks else None,
             protect=masks["floor"] if masks else None,
+            lamp_allow=lamp_allow,
         )
         img = match_neutral_whites(img)
         img = s_curve(img, strength=0.05)  # measured: gentle contrast
@@ -342,7 +377,26 @@ def process_brackets(images, enhance=True, pull_windows=False):
     if pull_windows:
         content = window_content(dark, wmask)
         if content is not None:
-            m = wmask[..., None]
+            # Build a robust blend mask. Three smooth, full-resolution
+            # gates — segmentation only FOCUSES, it never forces a paste:
+            #   * region: the glass (segmentation) if available, else the
+            #     clipped-highlight ramp;
+            #   * base bright: a real window opening is bright in the
+            #     merged image, so a dark wall can't be painted;
+            #   * content has detail: the darkest bracket must actually
+            #     show a lit view here. A mislabelled TV/dark frame is
+            #     near-black in the dark bracket, so this gate drops it —
+            #     that was the blocky black smudge in the archway.
+            base_luma = fused.mean(axis=2)
+            content_luma = content.mean(axis=2)
+            region = seg_win if seg_win is not None \
+                else np.clip((base_luma - 0.90) / 0.08, 0, 1)
+            blend = (region
+                     * np.clip((base_luma - 0.50) / 0.20, 0, 1)
+                     * np.clip((content_luma - 0.22) / 0.18, 0, 1))
+            kb = max(21, int(w * 0.012) | 1)   # heavy feather hides the
+            blend = cv2.GaussianBlur(blend, (kb, kb), 0) * 0.95  # blocky seg
+            m = blend[..., None]
             img = img * (1 - m) + content * m
 
     img = sharpen_two_stage(img)

@@ -37,6 +37,26 @@ from flask import Flask, request, send_file, render_template_string
 
 import pipeline
 
+# Hard-REFUSE to start if segmentation deps are missing. Running the app
+# with the wrong Python (system C:\ python has no torch/transformers)
+# silently disables window segmentation -> washed-out window pull. By
+# exiting here, the wrong Python can never bind the port and serve bad
+# results; only the venv (which has the deps) will run the server.
+import sys
+try:
+    import torch  # noqa: F401
+    import transformers  # noqa: F401
+    print(" * segmentation ENABLED (torch + transformers found)")
+except Exception:  # ImportError, or a broken torch (DLL load OSError, etc.)
+    sys.stderr.write(
+        "\n" + "!" * 70 + "\n"
+        "REFUSING TO START: torch/transformers not found in this Python.\n"
+        "You are running the WRONG Python. Window pull needs the venv.\n"
+        "Start the app with:\n"
+        "    D:\\autohdr-venv\\Scripts\\python.exe D:\\auto-hdr\\scripts\\app.py\n"
+        + "!" * 70 + "\n")
+    sys.exit(1)
+
 ROOT = Path(__file__).resolve().parent.parent
 RESULTS = ROOT / "web_output"
 if shutil.disk_usage(ROOT).free < 1 * 2**30:
@@ -128,4 +148,10 @@ def result(name):
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5050, debug=False)
+    # NO reloader: this venv's python.exe is a thin launcher over the C:
+    # base python, and Werkzeug's reloader re-spawned nested children that
+    # lost the venv environment -> fell back to the broken base python ->
+    # segmentation off -> washed-out window pull. One clean process avoids
+    # that entirely. Restart manually after code edits.
+    print("\n>>> AutoHDR server — http://127.0.0.1:5050  (one clean process)\n")
+    app.run(host="127.0.0.1", port=5050, debug=False, use_reloader=False)
